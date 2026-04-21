@@ -1,0 +1,683 @@
+---
+title: "Projet d'Économétrie Spatiale - Émissions de CO2 dans l'UE"
+author: "Master 2 ESEF - Université de Lorraine"
+date: '`r Sys.Date()`'
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r config, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+## Introduction
+
+L'objectif de cette étude est d'expliquer les émissions de CO2 par habitant dans l'Union Européenne en fonction du niveau de richesse, de la transition énergétique, de l'urbanisation et de la situation du marché du travail, tout en tenant compte des interactions spatiales entre pays voisins.
+
+Conformément à la consigne, nous traitons successivement une coupe transversale, une modélisation en panel, puis une version binaire logit/probit spatial.
+
+```{r setup, include=FALSE}
+library(sf)
+library(sp)
+library(spdep)
+library(spatialreg)
+library(readxl)
+library(dplyr)
+library(plm)
+library(splm)
+library(countrycode)
+library(ggplot2)
+library(ggrepel)
+library(knitr)
+library(car)
+library(patchwork)
+```
+
+# 1. Importation et préparation des données
+
+Nous utilisons la base EU fournie dans le dossier
+
+```{r import-data}
+# 1.1 Chargement de la base
+df_raw <- read_excel("C:/Users/sisso/Downloads/Dossier_à_rendre/data/EU/bdd_EU.xlsx")
+df_raw[df_raw == "NA"] <- NA
+
+cols_num <- c(
+  "CO2_emissions_per_capita",
+  "GDP_ppp",
+  "Renewable_energy_consumption_pct",
+  "Urban_population_pct",
+  "unemp_rate"
+)
+
+df_raw <- df_raw %>%
+  mutate(across(all_of(cols_num), as.numeric))
+
+# 1.2 Année retenue pour la coupe transversale
+df_2015 <- subset(df_raw, Year == 2015)
+df_2015 <- na.omit(df_2015[, c("Country Code", cols_num)])
+
+# 1.3 Conversion des codes iso3c vers Eurostat
+df_2015$code_2_lettres <- countrycode(
+  df_2015$`Country Code`,
+  origin = "iso3c",
+  destination = "eurostat"
+)
+
+df_raw$code_2_lettres <- countrycode(
+  df_raw$`Country Code`,
+  origin = "iso3c",
+  destination = "eurostat"
+)
+
+# 1.4 Chargement du fond de carte
+load("C:/Users/sisso/Downloads/Dossier_à_rendre/data/EU/EU_sh_countries.RData")
+EU_sf <- EU_sh_countries
+
+# 1.5 Fusion géographie + données 2015
+EU_sf_data <- merge(EU_sf, df_2015, by.x = "NUTS_ID", by.y = "code_2_lettres")
+EU_sp <- EU_sf_data
+EU_sp <- EU_sp[!is.na(EU_sp$CO2_emissions_per_capita), ]
+
+# Coordonnées des centroïdes
+coords_EU <- coordinates(EU_sp)
+EU_sf_plot <- st_as_sf(EU_sp)
+
+# Formule de base
+fm <- CO2_emissions_per_capita ~ GDP_ppp +
+  Renewable_energy_consumption_pct +
+  Urban_population_pct +
+  unemp_rate
+```
+
+# PARTIE A : Modélisation en coupe transversale (2015)
+
+## A.1 Variable expliquée, variables explicatives et objectif
+
+Pour la coupe transversale, nous retenons l’année 2015. La variable dépendante choisie est CO2_emissions_per_capita, car il s’agit d’une variable continue mesurant le niveau d’émissions de CO2 par habitant. Les variables explicatives retenues sont GDP_ppp, Renewable_energy_consumption_pct, Urban_population_pct et unemp_rate. Le PIB permet de mesurer le niveau de développement économique, la part des énergies renouvelables renseigne sur la transition énergétique, le taux d’urbanisation capte la concentration des activités et de la population, et le taux de chômage reflète indirectement le niveau d’activité économique. L’objectif est d’expliquer les écarts d’émissions de CO2 entre pays européens et de vérifier l’existence éventuelle d’interactions spatiales entre pays voisins.
+
+## A.2 Construction de 3 critères de voisinage
+
+Conformément à la consigne, nous construisons trois critères de voisinage :
+1. la contiguïté physique (Queen) ;
+2. les plus proches voisins (KNN, \(k=4\)) ;
+3. un voisinage par distance-seuil.
+
+```{r neighbors}
+sf::sf_use_s2(FALSE)
+
+# 1. Contiguïté Queen
+nb_contig <- poly2nb(EU_sp, queen = TRUE)
+
+# 2. K plus proches voisins
+nb_knn4 <- knn2nb(knearneigh(coords_EU, k = 4))
+
+# 3. Distance-seuil
+nb_dist <- dnearneigh(coords_EU, d1 = 0, d2 = 1500, longlat = TRUE)
+
+# Matrices de poids standardisées
+lw_contig <- nb2listw(nb_contig, style = "W", zero.policy = TRUE)
+lw_knn4_raw <- nb2listw(nb_knn4, style = "W", zero.policy = TRUE)
+lw_knn4 <- listw2U(lw_knn4_raw)
+lw_dist <- nb2listw(nb_dist, style = "W", zero.policy = TRUE)
+```
+
+```{r plot-neighbors, fig.width=14, fig.height=5}
+xlim <- c(-12, 35)
+ylim <- c(35, 72)
+
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+
+plot(st_geometry(EU_sf_plot),
+     border = "grey40", col = "grey95",
+     xlim = xlim, ylim = ylim,
+     main = "Contiguïté (Queen)")
+plot(nb_contig, coords_EU, add = TRUE, col = "#D95F02", lwd = 1.1)
+points(coords_EU, pch = 16, col = "#1F78B4", cex = 0.6)
+
+plot(st_geometry(EU_sf_plot),
+     border = "grey40", col = "grey95",
+     xlim = xlim, ylim = ylim,
+     main = "K plus proches voisins (K = 4)")
+plot(nb_knn4, coords_EU, add = TRUE, col = "#7570B3", lwd = 1.1)
+points(coords_EU, pch = 16, col = "#1F78B4", cex = 0.6)
+
+plot(st_geometry(EU_sf_plot),
+     border = "grey40", col = "grey95",
+     xlim = xlim, ylim = ylim,
+     main = "Voisinage par distance (1500 km)")
+plot(nb_dist, coords_EU, add = TRUE, col = "#1B9E77", lwd = 1.1)
+points(coords_EU, pch = 16, col = "#1F78B4", cex = 0.6)
+
+par(mfrow = c(1, 1))
+```
+
+## Visualisation descriptive
+
+```{r scatter-2015}
+df_2015$Country_Name <- countrycode(
+  df_2015$code_2_lettres,
+  origin = "eurostat",
+  destination = "country.name.fr"
+)
+
+ggplot(df_2015, aes(x = GDP_ppp / 1000, y = CO2_emissions_per_capita)) +
+  geom_point(color = "#5B9BD5", size = 3.5, alpha = 0.9) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ poly(x, 2),
+    color = "#2F5597",
+    linewidth = 1.2,
+    se = FALSE
+  ) +
+  geom_text_repel(
+    aes(label = Country_Name),
+    size = 3.2,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    segment.color = "grey60",
+    max.overlaps = Inf
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5, margin = margin(b = 15))
+  ) +
+  labs(
+    title = "Relation entre les émissions de CO2 et le PIB (2015)",
+    x = "PIB (en milliards, PPA)",
+    y = "Émissions de CO2 par habitant (tonnes)"
+  )
+```
+
+Le nuage de points permet de visualiser l'hétérogénéité importante entre pays européens et suggère qu'une relation simple entre richesse et émissions n'est pas suffisante, ce qui justifie l'introduction d'autres variables explicatives et l'examen de formes plus complexes.
+
+## A.3 Estimation d'un modèle OLS
+
+```{r ols}
+mod_OLS <- lm(fm, data = EU_sp@data)
+summary(mod_OLS)
+```
+
+### Interprétation du modèle OLS
+
+Le modèle OLS explique environ 42,6 % de la variance des émissions de CO2 par habitant, avec un \(R^2 = 0.4256\) et une significativité globale limite \((p = 0.05217)\).  
+Parmi les variables explicatives, seule la part des énergies renouvelables est significative au seuil de 5 %, avec un coefficient négatif \((-0.1195,\ p = 0.0213)\), ce qui indique qu'une hausse de la consommation d'énergies renouvelables est associée à une baisse des émissions de CO2 par habitant.  
+Le taux de chômage est négatif mais seulement marginalement significatif \((p = 0.0759)\), tandis que le PIB et le taux d'urbanisation ne sont pas statistiquement significatifs dans cette coupe transversale.
+
+## A.4 Tests d'autocorrélation spatiale
+
+```{r spatial-tests}
+# Moran sur la variable dépendante
+moran_co2_contig <- moran.test(EU_sp$CO2_emissions_per_capita, lw_contig, zero.policy = TRUE)
+moran_co2_knn <- moran.test(EU_sp$CO2_emissions_per_capita, lw_knn4_raw, zero.policy = TRUE)
+moran_co2_dist <- moran.test(EU_sp$CO2_emissions_per_capita, lw_dist, zero.policy = TRUE)
+moran_co2_contig
+moran_co2_knn
+moran_co2_dist
+
+# Moran sur les résidus OLS
+res_OLS <- residuals(mod_OLS)
+moran_res_co <- moran.test(res_OLS, lw_contig, zero.policy = TRUE)
+moran_res_knn <- moran.test(res_OLS, lw_knn4_raw, zero.policy = TRUE)
+moran_res_dis <- moran.test(res_OLS, lw_dist, zero.policy = TRUE)
+moran_res_co
+moran_res_knn
+moran_res_dis
+
+# Tests Rao's score
+rs_tests <- lm.RStests(mod_OLS, lw_contig, test = "all", zero.policy = TRUE)
+rs_tests
+```
+
+
+## Graphique LISA
+
+```{r lisa}
+# Carte du niveau de CO2
+p1 <- ggplot(data = EU_sf_plot) +
+  geom_sf(aes(fill = CO2_emissions_per_capita), color = "black", linewidth = 0.2) +
+  scale_fill_gradientn(
+    colors = c("#FFF5EB", "#FD8D3C", "#7F2704"),
+    name = "CO2 par hab."
+  ) +
+  coord_sf(xlim = c(-12, 35), ylim = c(35, 70), expand = FALSE) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(title = "Émissions de CO2 par habitant dans l'UE (2015)")
+
+# LISA
+local_moran <- localmoran(EU_sp$CO2_emissions_per_capita, lw_contig)
+EU_sf_plot$LISA_I <- local_moran[, "Ii"]
+
+p2 <- ggplot(data = EU_sf_plot) +
+  geom_sf(aes(fill = LISA_I), color = "black", linewidth = 0.2) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Indice LISA"
+  ) +
+  coord_sf(xlim = c(-12, 35), ylim = c(35, 70), expand = FALSE) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  labs(title = "Clusters spatiaux des émissions de CO2 (LISA)")
+
+p1 + p2
+```
+### Interprétation des cartes et des impacts du SDM
+
+La carte des émissions de CO2 par habitant (2015) révèle des niveaux plus élevés
+en Europe centrale et orientale (Estonie, République tchèque, Allemagne), tandis que
+les pays d'Europe du Sud et Scandinaves affichent des niveaux plus faibles.
+La carte LISA confirme les résultats des tests de Moran : les indices locaux sont
+proches de zéro pour la grande majorité des pays, sans cluster spatial net, ce qui
+est cohérent avec l'absence d'autocorrélation spatiale globale détectée précédemment.
+
+Les impacts du SDM montrent que l'effet total de la part des énergies renouvelables
+est négatif et significatif ($\beta_{total} = -0.098$, $p = 0.018$) : une augmentation
+de 1 point de pourcentage de la consommation d'énergies renouvelables est associée,
+toutes choses égales par ailleurs, à une réduction de 0.098 tonne de CO2 par habitant
+au niveau global, ce qui confirme la robustesse de cette variable.
+
+L'effet total de l'urbanisation est positif et significatif
+($\beta_{total} = +0.084$, $p = 0.008$), suggérant qu'en coupe transversale,
+une concentration urbaine plus forte est associée à un niveau plus élevé d'émissions
+par habitant, possiblement via une demande de mobilité et d'énergie plus importante.
+
+L'effet total du chômage est négatif et significatif
+($\beta_{total} = -0.250$, $p = 0.001$), cohérent avec l'idée qu'une contraction
+de l'activité économique réduit les émissions industrielles et de transport.
+
+En revanche, les effets indirects (*spillovers*) ne sont pas significatifs pour
+aucune variable, ce qui indique que les interactions spatiales entre pays voisins
+restent faibles ou mal identifiées dans cet échantillon réduit de 21 pays.
+Ce résultat est cohérent avec les diagnostics de Moran et la carte LISA présentés
+précédemment.
+
+## A.5 Estimation des modèles SAR, SEM, SDM, SARAR, SLX
+
+```{r models-cross}
+SARc <- lagsarlm(fm, data = EU_sp@data, listw = lw_contig, zero.policy = TRUE)
+SEMc <- errorsarlm(fm, data = EU_sp@data, listw = lw_contig, zero.policy = TRUE)
+SDMc <- lagsarlm(fm, data = EU_sp@data, listw = lw_contig, type = "mixed", zero.policy = TRUE)
+SARARc <- sacsarlm(fm, data = EU_sp@data, listw = lw_contig, zero.policy = TRUE)
+SLXc <- lmSLX(fm, data = EU_sp@data, listw = lw_contig, zero.policy = TRUE)
+
+AIC(mod_OLS, SARc, SEMc, SDMc, SARARc)
+summary(SLXc)
+```
+
+### Interprétation des modèles spatiaux
+
+La comparaison des AIC montre que le modèle SARAR présente la meilleure valeur
+$(AIC = 102.154)$, devant le SEM $(102.340)$, le SAR $(103.050)$ et
+l'OLS $(103.923)$, tandis que le SDM est moins performant $(108.218)$.
+Ces écarts restent néanmoins faibles, ce qui nuance la supériorité d'un modèle
+sur un autre.
+
+Le modèle SARAR produit cependant un paramètre $\rho = -1.200$, ce qui dépasse
+les bornes théoriques attendues et suggère une instabilité numérique. On lui
+préfère donc le **SEM** comme modèle de référence, qui offre le meilleur compromis
+entre ajustement et parcimonie.
+
+Le modèle SLX confirme l'absence d'effets spatiaux des variables explicatives :
+aucun lag spatial n'est significatif, ce qui va dans le sens des diagnostics
+de Moran réalisés précédemment.
+
+## A.6 Quel modèle choisir ?
+
+```{r model-choice-cross}
+aic_tab <- AIC(mod_OLS, SARc, SEMc, SDMc, SARARc)
+kable(aic_tab, digits = 3, caption = "Comparaison des AIC des modèles transversaux")
+```
+
+### Choix du modèle en coupe transversale
+
+Le choix final dépend ici du critère retenu.  
+Si l'on privilégie la parcimonie et les tests d'autocorrélation, le modèle OLS peut être retenu comme modèle principal, car il n'existe pas de preuve forte de dépendance spatiale globale.  
+En revanche, si l'on raisonne en termes de qualité d'ajustement parmi les modèles spatiaux imposés par la consigne, le modèle SARAR est le meilleur selon l'AIC, avec le SEM comme alternative très proche.  
+Dans ce dossier, on peut donc présenter l'OLS comme modèle de référence et le SARAR comme meilleur modèle spatial comparatif.
+
+## A.7 Impacts à partir du modèle SDM
+
+```{r impacts-sdm}
+imp_SDMc <- impacts(SDMc, listw = lw_contig, R = 100)
+summary(imp_SDMc, zstats = TRUE, short = TRUE)
+```
+
+### Interprétation des impacts du SDM
+
+
+
+Les impacts du SDM montrent que l'effet total de la part des énergies renouvelables
+est négatif et significatif ($\beta_{total} = -0.098$, $p = 0.018$) : une augmentation
+de 1 point de pourcentage de la consommation d'énergies renouvelables est associée,
+toutes choses égales par ailleurs, à une réduction de 0.098 tonne de CO2 par habitant
+au niveau global, ce qui confirme la robustesse de cette variable.
+
+L'effet total de l'urbanisation est positif et significatif
+($\beta_{total} = +0.084$, $p = 0.008$), suggérant qu'en coupe transversale,
+une concentration urbaine plus forte est associée à un niveau plus élevé d'émissions
+par habitant, possiblement via une demande de mobilité et d'énergie plus importante.
+
+L'effet total du chômage est négatif et significatif
+($\beta_{total} = -0.250$, $p = 0.001$), cohérent avec l'idée qu'une contraction
+de l'activité économique réduit les émissions industrielles et de transport.
+
+En revanche, les effets indirects (*spillovers*) ne sont pas significatifs pour
+aucune variable, ce qui indique que les interactions spatiales entre pays voisins
+restent faibles ou mal identifiées dans cet échantillon réduit de 21 pays.
+Ce résultat est cohérent avec les diagnostics de Moran présentés précédemment.
+
+# PARTIE B : Modélisation avec données de panel
+
+Questions similaires à celles de la partie A. Répondre aux questions de 1 à 7 en exploitant la dimension panel
+
+## B.1 Construction du panel
+
+```{r panel-data}
+pays_carte <- EU_sp$NUTS_ID
+
+df_panel <- df_raw %>%
+  filter(code_2_lettres %in% pays_carte) %>%
+  select(code_2_lettres, Year, all_of(cols_num)) %>%
+  na.omit()
+
+pdata <- pdata.frame(df_panel, index = c("code_2_lettres", "Year"))
+pdata <- make.pbalanced(pdata, balance.type = "shared.individuals")
+```
+
+## B.2 Statistiques descriptives, corrélations et VIF
+
+```{r panel-desc}
+stats_desc <- data.frame(
+  Variable = cols_num,
+  Obs = sapply(df_panel[cols_num], function(x) sum(!is.na(x))),
+  Moyenne = sapply(df_panel[cols_num], mean, na.rm = TRUE),
+  Ecart_Type = sapply(df_panel[cols_num], sd, na.rm = TRUE),
+  Min = sapply(df_panel[cols_num], min, na.rm = TRUE),
+  Max = sapply(df_panel[cols_num], max, na.rm = TRUE)
+)
+
+kable(
+  stats_desc,
+  digits = 2,
+  row.names = FALSE,
+  caption = "Tableau 1 : Statistiques descriptives des variables du panel"
+)
+
+matrice_cor <- cor(df_panel[cols_num], use = "complete.obs")
+kable(
+  matrice_cor,
+  digits = 3,
+  caption = "Tableau 2 : Matrice de corrélation de Pearson"
+)
+
+modele_pour_vif <- lm(fm, data = df_panel)
+valeurs_vif <- vif(modele_pour_vif)
+
+kable(
+  data.frame(Variable = names(valeurs_vif), VIF = valeurs_vif),
+  digits = 2,
+  row.names = FALSE,
+  caption = "Tableau 3 : Facteur d'inflation de la variance (VIF)"
+)
+```
+
+Les statistiques descriptives, les corrélations et les VIF permettent de vérifier la cohérence des ordres de grandeur et d'écarter un problème majeur de multicolinéarité avant l'estimation des modèles panel.
+
+## B.3 Visualisation temporelle
+
+```{r panel-maps}
+df_2000 <- subset(df_panel, Year == 2000)
+map_2000 <- merge(EU_sf, df_2000, by.x = "NUTS_ID", by.y = "code_2_lettres")
+map_2000 <- st_as_sf(map_2000)
+
+df_2015_map <- subset(df_panel, Year == 2015)
+map_2015 <- merge(EU_sf, df_2015_map, by.x = "NUTS_ID", by.y = "code_2_lettres")
+map_2015 <- st_as_sf(map_2015)
+
+zoom_coord <- coord_sf(xlim = c(-12, 35), ylim = c(35, 70), expand = FALSE)
+theme_carte <- theme_void() +
+  theme(plot.title = element_text(size = 10, face = "bold", hjust = 0.5))
+
+pA <- ggplot(data = map_2000) +
+  geom_sf(aes(fill = Renewable_energy_consumption_pct), color = "black", linewidth = 0.1) +
+  scale_fill_gradientn(colors = c("#FFF5EB", "#FD8D3C", "#7F2704"), name = "% Renouv.") +
+  zoom_coord + theme_carte + labs(title = "A. Énergies renouvelables (2000)")
+
+pB <- ggplot(data = map_2000) +
+  geom_sf(aes(fill = CO2_emissions_per_capita), color = "black", linewidth = 0.1) +
+  scale_fill_gradientn(colors = c("#F7FBFF", "#9ECAE1", "#08306B"), name = "CO2 hab.") +
+  zoom_coord + theme_carte + labs(title = "B. Émissions CO2 (2000)")
+
+pC <- ggplot(data = map_2015) +
+  geom_sf(aes(fill = Renewable_energy_consumption_pct), color = "black", linewidth = 0.1) +
+  scale_fill_gradientn(colors = c("#FFF5EB", "#FD8D3C", "#7F2704"), name = "% Renouv.") +
+  zoom_coord + theme_carte + labs(title = "C. Énergies renouvelables (2015)")
+
+pD <- ggplot(data = map_2015) +
+  geom_sf(aes(fill = CO2_emissions_per_capita), color = "black", linewidth = 0.1) +
+  scale_fill_gradientn(colors = c("#F7FBFF", "#9ECAE1", "#08306B"), name = "CO2 hab.") +
+  zoom_coord + theme_carte + labs(title = "D. Émissions CO2 (2015)")
+
+(pA | pB) / (pC | pD)
+```
+
+La mosaïque met en évidence l'évolution conjointe des émissions de CO2 et de la place des énergies renouvelables entre 2000 et 2015, ce qui motive l'exploitation de la dimension temporelle du panel.
+
+## B.4 Modèle panel de base
+
+```{r panel-base}
+pool_panel <- plm(fm, data = pdata, model = "pooling")
+fe_panel <- plm(fm, data = pdata, model = "within")
+re_panel <- plm(fm, data = pdata, model = "random")
+
+summary(pool_panel)
+summary(fe_panel)
+summary(re_panel)
+phtest(fe_panel, re_panel)
+```
+
+### Interprétation des modèles panel de base
+
+Le modèle pooling présente un \(R^2 = 0.4070\), alors que le modèle à effets fixes atteint \(R^2 = 0.5403\), ce qui traduit une amélioration nette de l'ajustement lorsque l'on contrôle l'hétérogénéité propre à chaque pays.  
+Dans le modèle à effets fixes, la part des énergies renouvelables est fortement négative et très significative, l'urbanisation devient négative et significative, et le taux de chômage est également négatif et significatif.  
+Le PIB n'est pas significatif dans la spécification à effets fixes.
+
+Le modèle à effets aléatoires affiche un paramètre $\theta = 0.939$, ce qui
+indique que 93.6 % de la variance totale est due à l'hétérogénéité entre pays
+plutôt qu'à la variation temporelle. Cela renforce l'idée que les différences
+structurelles entre pays dominent la dynamique des émissions de CO2.
+
+Le test de Hausman est très significatif, ce qui conduit à privilégier le modèle à effets fixes plutôt que le modèle à effets aléatoires.
+
+## B.5 Tests d'autocorrélation spatiale en panel
+
+```{r panel-tests}
+slmtest(fm, data = pdata, listw = lw_knn4_raw, test = "lml", model = "within")
+slmtest(fm, data = pdata, listw = lw_knn4_raw, test = "lme", model = "within")
+slmtest(fm, data = pdata, listw = lw_knn4_raw, test = "rlml", model = "within")
+slmtest(fm, data = pdata, listw = lw_knn4_raw, test = "rlme", model = "within")
+```
+
+### Interprétation des tests spatiaux panel
+
+Les tests LM panel ne mettent pas en évidence une dépendance spatiale très forte.  
+Le LM-lag classique n'est pas significatif \((p = 0.26)\), le LM-error ne l'est pas non plus \((p = 0.8844)\), et seul le robuste LM-lag est faiblement significatif au seuil de 10 % \((p = 0.0804)\).  
+Ces résultats suggèrent au mieux un signal limité en faveur d'une dépendance spatiale de type lag, mais pas une preuve forte d'un besoin impératif de spatialiser le modèle panel.
+
+## B.6 Modèles spatiaux en panel
+
+```{r panel-models}
+SAR_panel <- spml(
+  fm, data = pdata, listw = lw_knn4_raw,
+  model = "within", lag = TRUE, spatial.error = "none"
+)
+
+SEM_panel <- spml(
+  fm, data = pdata, listw = lw_knn4_raw,
+  model = "within", lag = FALSE, spatial.error = "b"
+)
+
+SARAR_panel <- spml(
+  fm, data = pdata, listw = lw_knn4_raw,
+  model = "within", lag = TRUE, spatial.error = "b"
+)
+
+summary(SAR_panel)
+summary(SEM_panel)
+summary(SARAR_panel)
+```
+
+### Interprétation des modèles spatiaux panel
+
+Dans le modèle SAR panel, le coefficient spatial \(\lambda = 0.0665\) n'est pas significatif \((p = 0.2946)\).  
+Dans le modèle SEM panel, le paramètre d'erreur spatiale \(\rho = 0.0127\) n'est pas significatif \((p = 0.8726)\).  
+Ces deux résultats confirment que la dépendance spatiale simple reste faible une fois contrôlés les effets fixes des pays.  
+Le modèle SARAR panel produit des paramètres spatiaux très significatifs, mais avec une valeur extrême pour \(\rho\), ce qui impose une interprétation prudente.  
+Sur le plan économique, la variable la plus robuste demeure la part des énergies renouvelables, toujours négative et très significative dans toutes les spécifications panel.
+
+## B.7 Choix du modèle panel
+
+```{r panel-choice}
+sphtest(
+  fm,
+  data = pdata,
+  index = c("code_2_lettres", "Year"),
+  listw = lw_knn4_raw,
+  spatial.model = "lag",
+  method = "ML"
+)
+```
+
+### Choix du modèle en panel
+
+Le test de Hausman spatial est significatif, ce qui conforte le choix d'une spécification à effets fixes.  
+Compte tenu des tests LM panel, de la non-significativité des paramètres spatiaux dans les modèles SAR et SEM, et de la prudence nécessaire face au SARAR panel, le modèle à effets fixes non spatial apparaît comme le choix principal le plus robuste.  
+Les modèles spatiaux panel peuvent être conservés comme analyses complémentaires de robustesse.
+
+# PARTIE C : Modélisation logit / probit spatial
+
+## C.1 Transformation binaire
+
+```{r binary}
+mediane_CO2 <- median(EU_sp$CO2_emissions_per_capita, na.rm = TRUE)
+EU_sp$CO2_bin <- ifelse(EU_sp$CO2_emissions_per_capita > mediane_CO2, 1, 0)
+
+fm_bin <- CO2_bin ~ GDP_ppp +
+  Renewable_energy_consumption_pct +
+  Urban_population_pct +
+  unemp_rate
+```
+
+La variable dépendante binaire oppose ici les pays à fortes émissions à ceux situés sous la médiane des émissions de CO2 par habitant.
+
+## C.2 Logit / probit simple, GMM 1 étape, GMM 2 étapes
+
+```{r probit-models}
+# Probit simple
+probit_simple <- glm(
+  fm_bin,
+  data = EU_sp@data,
+  family = binomial(link = "probit")
+)
+
+summary(probit_simple)
+
+# Probit spatial approx. 1 étape
+WY <- lag.listw(lw_contig, EU_sp$CO2_bin, zero.policy = TRUE)
+
+probit_gmm1 <- glm(
+  CO2_bin ~ GDP_ppp + Renewable_energy_consumption_pct +
+    Urban_population_pct + unemp_rate + WY,
+  data = EU_sp@data,
+  family = binomial(link = "probit")
+)
+
+summary(probit_gmm1)
+
+# Probit spatial approx. 2 étapes
+WX_gdp <- lag.listw(lw_contig, EU_sp$GDP_ppp, zero.policy = TRUE)
+WX_ren <- lag.listw(lw_contig, EU_sp$Renewable_energy_consumption_pct, zero.policy = TRUE)
+
+reg_etape1 <- lm(
+  WY ~ GDP_ppp + Renewable_energy_consumption_pct + WX_gdp + WX_ren,
+  data = EU_sp@data
+)
+
+EU_sp$WY_hat <- fitted(reg_etape1)
+
+probit_gmm2 <- glm(
+  CO2_bin ~ GDP_ppp + Renewable_energy_consumption_pct +
+    Urban_population_pct + unemp_rate + WY_hat,
+  data = EU_sp@data,
+  family = binomial(link = "probit")
+)
+
+summary(probit_gmm2)
+```
+
+### Interprétation des modèles probit
+
+Dans le probit simple, seul le taux de chômage est significatif au seuil de 5 %, avec un coefficient négatif, ce qui suggère qu'une hausse du chômage réduit la probabilité d'appartenir au groupe des pays fortement émetteurs.  
+Dans le probit spatial GMM en une étape, l'ajustement s'améliore nettement et le terme spatial \(WY\) est négatif et marginalement significatif.  
+Cela suggère l'existence possible d'un effet de voisinage, mais cette conclusion doit être nuancée car l'estimation s'accompagne d'un avertissement numérique sur les probabilités ajustées.  
+Dans le probit GMM en deux étapes, le terme spatial instrumenté n'est plus significatif, ce qui affaiblit l'idée d'un effet spatial robuste dans la variable binaire.
+
+## C.3 Quel est le meilleur modèle ?
+
+```{r probit-choice}
+AIC(probit_simple, probit_gmm1, probit_gmm2)
+```
+
+### Choix du modèle probit
+
+Selon l'AIC, le meilleur modèle est le probit spatial GMM en une étape.  
+Il améliore nettement l'ajustement par rapport au probit simple et au probit GMM en deux étapes.  
+Toutefois, compte tenu de la petite taille de l'échantillon et de l'avertissement numérique signalé pendant l'estimation, ce résultat doit être présenté avec prudence.  
+On peut donc retenir le GMM 1 étape comme meilleur modèle binaire au sens statistique, tout en soulignant sa fragilité économétrique.
+
+# Conclusion
+
+Les résultats indiquent que la part des énergies renouvelables est le déterminant
+le plus robuste des émissions de CO2 dans l'UE, quelle que soit la spécification
+retenue.
+
+En coupe transversale, les tests ne mettent pas en évidence une dépendance
+spatiale forte : l'OLS reste défendable comme modèle principal, et le SEM
+constitue la meilleure spécification spatiale alternative.
+
+En panel, les effets fixes absorbent l'hétérogénéité entre pays et améliorent
+sensiblement l'ajustement. Les tests LM ne révèlent pas de dépendance spatiale
+forte une fois ces effets contrôlés.
+
+Enfin, la partie probit confirme le rôle du chômage sur la classification
+binaire des pays, mais la dimension spatiale reste fragile sur un échantillon
+aussi réduit.
